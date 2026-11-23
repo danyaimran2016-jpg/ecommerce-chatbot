@@ -14,9 +14,7 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const apiKey =
-      process.env.GEMINI_API_KEY ||
-      "GEMINI_API_KEY";
+    const apiKey = process.env.GEMINI_API_KEY || "";
     const model = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
     // Fetch live product data from Google Sheet
