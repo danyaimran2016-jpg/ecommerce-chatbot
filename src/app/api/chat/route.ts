@@ -2,6 +2,38 @@ import { NextRequest, NextResponse } from "next/server";
 import { getStoreProducts } from "@/lib/products";
 
 export const dynamic = "force-dynamic";
+// Run the function close to Pakistan (Mumbai) instead of the default US region
+export const preferredRegion = "bom1";
+export const maxDuration = 30;
+
+// ---- Product cache: avoid re-fetching the Google Sheet on every message ----
+const CACHE_TTL_MS = 60 * 1000; // refresh sheet data at most once per minute
+let cachedCatalog: { text: string; time: number } | null = null;
+
+async function getCatalogText(): Promise<string> {
+  if (cachedCatalog && Date.now() - cachedCatalog.time < CACHE_TTL_MS) {
+    return cachedCatalog.text;
+  }
+
+  const { allProducts } = await getStoreProducts();
+
+  const text = allProducts
+    .map(
+      (p) =>
+        `* ${p.title}
+  - Category: ${p.category || "General"}
+  - Price: $${p.price}
+  - Stock Status: ${p.stockStatus || "in stock"}
+  - Description: ${p.description || "N/A"}
+  - Store Page Link: /shop/product/${p.id}/${encodeURIComponent(
+          p.title.split(" ").join("-")
+        )}`
+    )
+    .join("\n\n");
+
+  cachedCatalog = { text, time: Date.now() };
+  return text;
+}
 
 export async function POST(req: NextRequest) {
   try {
@@ -14,25 +46,17 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const apiKey = process.env.GEMINI_API_KEY || "";
+    const apiKey = process.env.GEMINI_API_KEY;
+    if (!apiKey) {
+      console.error("GEMINI_API_KEY is not set");
+      return NextResponse.json(
+        { error: "Chat is not configured." },
+        { status: 500 }
+      );
+    }
     const model = process.env.GEMINI_MODEL || "gemini-3.6-flash";
 
-    // Fetch live product data from Google Sheet
-    const { allProducts } = await getStoreProducts();
-
-    const catalogList = allProducts
-      .map(
-        (p) =>
-          `* ${p.title}
-  - Category: ${p.category || "General"}
-  - Price: $${p.price}
-  - Stock Status: ${p.stockStatus || "in stock"}
-  - Description: ${p.description || "N/A"}
-  - Store Page Link: /shop/product/${p.id}/${encodeURIComponent(
-            p.title.split(" ").join("-")
-          )}`
-      )
-      .join("\n\n");
+    const catalogList = await getCatalogText();
 
     const systemInstruction = `You are the official AI Shopping Assistant for "Shop.co", a trendy and modern fashion and lifestyle store.
 
@@ -48,16 +72,15 @@ CORE RULES:
 CURRENT STORE INVENTORY (Synced live from Google Sheet):
 ${catalogList}`;
 
-    // Format chat messages for Gemini v1beta API
-    // Gemini expects alternating user and model roles
+    // Only send the last 10 messages to keep the request small and fast
     const contents = messages
+      .slice(-10)
       .filter((m: { role: string; content: string }) => m.content && m.content.trim() !== "")
       .map((m: { role: string; content: string }) => ({
         role: m.role === "assistant" ? "model" : "user",
         parts: [{ text: m.content }],
       }));
 
-    // Ensure the last message is from user
     if (contents.length === 0 || contents[contents.length - 1].role !== "user") {
       return NextResponse.json(
         { error: "Last message must be from the user." },
@@ -65,56 +88,56 @@ ${catalogList}`;
       );
     }
 
-    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+    // Key goes in a header instead of the URL (keeps it out of logs)
+    const apiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`;
+
+    const body = JSON.stringify({
+      system_instruction: { parts: [{ text: systemInstruction }] },
+      contents,
+      generationConfig: {
+        temperature: 0.7,
+        maxOutputTokens: 250,
+        thinkingConfig: { thinkingBudget: 0 },
+      },
+    });
 
     let geminiRes: Response | null = null;
-    let attempts = 0;
-    const maxAttempts = 3;
+    const maxAttempts = 2;
 
-    while (attempts < maxAttempts) {
-      attempts++;
-      geminiRes = await fetch(apiUrl, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({
-          system_instruction: {
-            parts: [{ text: systemInstruction }],
+    for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+      try {
+        geminiRes = await fetch(apiUrl, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": apiKey,
           },
-          contents,
-          generationConfig: {
-            temperature: 0.7,
-            maxOutputTokens: 250,
-            thinkingConfig: {
-              thinkingBudget: 0,
-            },
-          },
-        }),
-      });
-
-      if (geminiRes.ok) {
-        break;
+          body,
+          // Give up on a stuck request instead of hanging forever
+          signal: AbortSignal.timeout(12000),
+        });
+      } catch (err) {
+        console.warn(`Gemini request failed/timed out (attempt ${attempt})`, err);
+        geminiRes = null;
+        continue;
       }
 
-      // If 503 (temporarily overloaded) or 429 (rate limit), wait and retry
+      if (geminiRes.ok) break;
+
       if (geminiRes.status === 503 || geminiRes.status === 429) {
-        console.warn(`Gemini returned status ${geminiRes.status}. Retrying attempt ${attempts}...`);
-        await new Promise((r) => setTimeout(r, 1200 * attempts));
+        console.warn(`Gemini returned ${geminiRes.status}. Retrying (attempt ${attempt})...`);
+        await new Promise((r) => setTimeout(r, 600));
       } else {
         break;
       }
     }
 
     if (!geminiRes || !geminiRes.ok) {
-      const errorText = geminiRes ? await geminiRes.text() : "No response";
+      const errorText = geminiRes ? await geminiRes.text() : "No response / timeout";
       console.error("Gemini API error:", geminiRes?.status, errorText);
       return NextResponse.json(
-        {
-          error: "Failed to generate response from Gemini.",
-          details: errorText,
-        },
-        { status: geminiRes ? geminiRes.status : 500 }
+        { error: "The assistant is busy right now. Please try again in a moment." },
+        { status: geminiRes ? geminiRes.status : 504 }
       );
     }
 
@@ -123,7 +146,6 @@ ${catalogList}`;
       data.candidates?.[0]?.content?.parts?.[0]?.text ||
       "I'm sorry, I couldn't formulate a response right now. Please try again!";
 
-    // Strictly ensure maximum length is at most 50 words
     const words = rawReply.trim().split(/\s+/);
     const reply =
       words.length > 50 ? words.slice(0, 50).join(" ") + "..." : rawReply;
@@ -137,4 +159,3 @@ ${catalogList}`;
     );
   }
 }
-
