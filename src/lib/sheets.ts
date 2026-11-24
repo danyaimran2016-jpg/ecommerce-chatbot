@@ -104,21 +104,38 @@ export async function fetchProductsFromGoogleSheet(): Promise<Product[]> {
       return cachedProducts.products;
     }
 
-    const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "ecommerceai-514910-f20236f6f622.json";
     const spreadsheetId = process.env.GOOGLE_SPREADSHEET_ID || "1s2UkSygy1RZUsQEA8LNgfCZcH_pMqgPw6hOJ4IDr2RE";
     const range = process.env.GOOGLE_SHEET_RANGE || "Sheet1!A1:Z100";
 
     if (!cachedCreds) {
-      const keyPath = path.isAbsolute(keyFile)
-        ? keyFile
-        : path.join(process.cwd(), keyFile);
-
-      if (!fs.existsSync(keyPath)) {
-        console.warn(`Service account key not found at: ${keyPath}. Using fallback data.`);
-        return cachedProducts ? cachedProducts.products : [];
+      // 1. Check if full credentials JSON is supplied directly in environment variable (for Vercel/Cloud)
+      const envCreds = process.env.GOOGLE_SERVICE_ACCOUNT_JSON || process.env.GOOGLE_SERVICE_ACCOUNT_CREDENTIALS;
+      if (envCreds) {
+        try {
+          cachedCreds = JSON.parse(
+            envCreds.trim().startsWith("{")
+              ? envCreds
+              : Buffer.from(envCreds, "base64").toString("utf8")
+          );
+        } catch (e) {
+          console.error("Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", e);
+        }
       }
 
-      cachedCreds = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+      // 2. Check if a local JSON file path exists
+      if (!cachedCreds) {
+        const keyFile = process.env.GOOGLE_SERVICE_ACCOUNT_KEY_FILE || "ecommerceai-514910-f20236f6f622.json";
+        const keyPath = path.isAbsolute(keyFile)
+          ? keyFile
+          : path.join(process.cwd(), keyFile);
+
+        if (fs.existsSync(keyPath)) {
+          cachedCreds = JSON.parse(fs.readFileSync(keyPath, "utf8"));
+        } else {
+          console.warn(`Service account key not found at: ${keyPath}. Using fallback catalog.`);
+          return cachedProducts ? cachedProducts.products : [];
+        }
+      }
     }
 
     const creds = cachedCreds;
@@ -219,4 +236,3 @@ export async function fetchProductsFromGoogleSheet(): Promise<Product[]> {
     return cachedProducts ? cachedProducts.products : [];
   }
 }
-

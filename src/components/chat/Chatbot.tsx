@@ -70,7 +70,12 @@ export default function Chatbot() {
         body: JSON.stringify({ messages: history }),
       });
 
-      const data = await res.json();
+      let data: any = {};
+      try {
+        data = await res.json();
+      } catch {
+        data = {};
+      }
 
       if (res.ok && data.reply) {
         setMessages((prev) => [
@@ -82,13 +87,15 @@ export default function Chatbot() {
           },
         ]);
       } else {
+        const fallbackText =
+          data.error ||
+          "Sorry, our AI assistant is experiencing high traffic right now. For urgent help or questions, please email test@gmail.com!";
         setMessages((prev) => [
           ...prev,
           {
             id: (Date.now() + 1).toString(),
             role: "assistant",
-            content:
-              "Sorry, I encountered an issue connecting to the assistant. Please try again.",
+            content: fallbackText,
           },
         ]);
       }
@@ -99,7 +106,7 @@ export default function Chatbot() {
         {
           id: (Date.now() + 1).toString(),
           role: "assistant",
-          content: "Sorry, network error occurred. Please check your connection.",
+          content: "Network issue detected. Please check your connection or reach us directly at test@gmail.com.",
         },
       ]);
     } finally {
